@@ -1,0 +1,155 @@
+import time
+import paho.mqtt.client as mqtt
+import RPi.GPIO as GPIO
+import cv2
+import torch
+import numpy as np
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import db
+
+# Configuration du servo moteur et du capteur à ultrasons
+servo_pin = 17  # Broche GPIO pour le servo
+ultrasonic_trig = 23  # Broche GPIO pour le trigger du capteur à ultrasons
+ultrasonic_echo = 24  # Broche GPIO pour l'écho du capteur à ultrasons
+
+# Configurer les GPIO
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(servo_pin, GPIO.OUT)
+GPIO.setup(ultrasonic_trig, GPIO.OUT)
+GPIO.setup(ultrasonic_echo, GPIO.IN)
+
+# Configurer le servo
+servo = GPIO.PWM(servo_pin, 50)  # Fréquence de 50Hz
+servo.start(0)
+
+# Configuration MQTT
+BROKER = "localhost"  # Broker MQTT sur Raspberry Pi
+PORT = 1883
+TOPIC = "esp32/parking"
+CLIENT_ID = "Raspberry_Client"
+
+# Initialisation de YOLOv5
+model = torch.hub.load("ultralytics/yolov5", "yolov5s")  # Charger le modèle YOLOv5 (modèle petit)
+
+# Initialiser Firebase
+cred = credentials.Certificate("/home/pi/Downloads/parcking-m-2871d-firebase-adminsdk-qjivv-549e246035.json")  # Remplacez par le chemin vers le fichier JSON
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://parcking-m-2871d-default-rtdb.firebaseio.com/'  # Remplacez par l'URL de votre base de données Firebase
+})
+
+# Référence vers la base de données Firebase
+ref = db.reference('/parking')
+
+# Callback lors de la réception d'un message MQTT
+def on_message(client, userdata, message):
+    print(f"Message reçu : {message.payload.decode()} sur le topic {message.topic}")
+    if message.payload.decode() == "Place libre":
+        print("Commande : Ouvrir la barrière")
+        ouvrir_barriere()
+        envoyer_donnees_firebase("Place libre")
+    else:
+        print("Commande : Fermer la barrière")
+        fermer_barriere()
+        envoyer_donnees_firebase("Place occupée")
+
+# Fonction pour ouvrir la barrière (servo moteur)
+def ouvrir_barriere():
+    servo.ChangeDutyCycle(7)  # Angle du servo pour ouvrir la barrière
+    time.sleep(1)
+
+# Fonction pour fermer la barrière (servo moteur)
+def fermer_barriere():
+    servo.ChangeDutyCycle(12)  # Angle du servo pour fermer la barrière
+    time.sleep(1)
+
+# Fonction de mesure de distance avec le capteur à ultrasons
+def mesurer_distance():
+    GPIO.output(ultrasonic_trig, GPIO.LOW)
+    time.sleep(0.1)
+    GPIO.output(ultrasonic_trig, GPIO.HIGH)
+    time.sleep(0.00001)
+    GPIO.output(ultrasonic_trig, GPIO.LOW)
+   
+    while GPIO.input(ultrasonic_echo) == GPIO.LOW:
+        pulse_start = time.time()
+
+    while GPIO.input(ultrasonic_echo) == GPIO.HIGH:
+        pulse_end = time.time()
+
+    pulse_duration = pulse_end - pulse_start
+    distance = pulse_duration * 17150  # Calcul de la distance en cm
+    return distance
+
+# Fonction pour capturer et traiter l'image avec YOLOv5
+def detecter_immatriculation():
+    cap = cv2.VideoCapture(0)  # Ouvrir la caméra
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+       
+        # Passer l'image à YOLOv5 pour la détection
+        results = model(frame)
+       
+        # Afficher les résultats de la détection sur l'image
+        results.show()
+
+        # Extraire les plaques d'immatriculation détectées
+        for pred in results.xywh[0]:
+            if pred[4] > 0.5:  # Seuil de confiance pour détecter les plaques
+                x1, y1, x2, y2 = int(pred[0] * frame.shape[1]), int(pred[1] * frame.shape[0]), int(pred[2] * frame.shape[1]), int(pred[3] * frame.shape[0])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Affichage de la boîte autour de la plaque
+               
+                # Si plaque détectée, envoyer la commande via MQTT
+                client.publish("esp32/parking", "Place libre")
+               
+                # Envoyer les données de détection à Firebase
+                envoyer_donnees_firebase("Place libre", "Plaque détectée")
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# Fonction pour envoyer des données à Firebase
+def envoyer_donnees_firebase(etat_place, message=""):
+    # Envoyer l'état du parking et un message de détection à Firebase
+    ref.update({
+        'etat_place': etat_place,
+        'message': message,
+        'timestamp': time.time()
+    })
+    print(f"Données envoyées à Firebase: {etat_place}, {message}")
+
+# Initialisation du client MQTT
+client = mqtt.Client(CLIENT_ID)
+client.on_message = on_message
+client.connect(BROKER, PORT)
+client.subscribe(TOPIC)
+
+# Boucle principale
+def main():
+    client.loop_start()  # Démarrer la boucle MQTT pour écouter les messages
+
+    try:
+        while True:
+            distance = mesurer_distance()
+            print(f"Distance mesurée : {distance} cm")
+            if distance < 10:  # Si un objet est détecté à moins de 10 cm
+                print("Objet détecté à proximité")
+            else:
+                print("Aucun objet détecté")
+               
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        client.loop_stop()  # Arrêter la boucle MQTT
+        servo.stop()
+        GPIO.cleanup()  # Nettoyer les GPIO
+
+if __name__ == "__main__":
+    detecter_immatriculation()  # Démarrer la détection de plaques d'immatriculation
+    main()
