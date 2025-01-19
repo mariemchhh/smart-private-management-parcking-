@@ -1,0 +1,116 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// Définir les pins pour les capteurs et les LEDs
+#define IR 34         // Entrée du capteur IR TCR5000 (GPIO34)
+#define ledR 25       // LED indiquant une place occupée (GPIO25)
+#define ledV 26       // LED indiquant une place libre (GPIO26)
+
+// Identifiants Wi-Fi
+const char* ssid = "mariem";              
+const char* password = "123456789";      
+
+// Adresse du broker MQTT (IP de la Raspberry Pi ou autre adresse IP du broker)
+const char* mqtt_server = "192.168.43.82";    // Remplacez par l'adresse IP de votre Raspberry Pi ou votre broker MQTT
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Variables globales
+int lastState = -1;  // Dernier état lu du capteur IR (pour éviter des publications répétées)
+
+void setup_wifi() {
+  delay(10);
+  Serial.println("Connexion au Wi-Fi...");
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnecté au Wi-Fi avec IP : ");
+  Serial.println(WiFi.localIP());  // Afficher l'IP obtenue
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Connexion au broker MQTT...");
+    if (client.connect("ESP32Client")) {
+      Serial.println("Connecté !");
+      client.subscribe("rpi/broadcast");  // S'abonner à un topic pour recevoir des messages
+    } else {
+      Serial.print("Échec, code d'erreur = ");
+      Serial.print(client.state());
+      Serial.println(" Nouvelle tentative dans 5 secondes...");
+      delay(5000);
+    }
+  }
+}
+
+// Cette fonction sera appelée chaque fois qu'un message est reçu sur les topics auxquels l'ESP32 est abonné
+void callback(char* topic, byte* message, unsigned int length) {
+  Serial.print("Message reçu sur le topic: ");
+  Serial.print(topic);
+  Serial.print(". Message: ");
+  String messageTemp;
+
+  for (int i = 0; i < length; i++) {
+    messageTemp += (char)message[i];
+  }
+
+  Serial.println(messageTemp);
+
+  // Exemple de traitement d'un message sur un topic spécifique
+  if (String(topic) == "rpi/broadcast") {
+    if (messageTemp == "10") {
+      Serial.println("Action: blink LED");
+      // Code pour effectuer une action spécifique (ex: clignoter une LED)
+      digitalWrite(ledV, HIGH);  // Exemple : allumer la LED verte
+    }
+  }
+}
+
+void setup() {
+  pinMode(IR, INPUT);     // Configurer le capteur IR comme entrée
+  pinMode(ledR, OUTPUT);  // Configurer la LED rouge comme sortie
+  pinMode(ledV, OUTPUT);  // Configurer la LED verte comme sortie
+
+  digitalWrite(ledR, LOW);  // Éteindre la LED "Occupée"
+  digitalWrite(ledV, LOW);  // Éteindre la LED "Libre"
+
+  Serial.begin(115200);  // Initialiser la communication série
+  setup_wifi();          // Connecter au Wi-Fi
+  client.setServer(mqtt_server, 1883);  // Configurer l'adresse du broker MQTT
+  client.setCallback(callback);  // Configurer la fonction de callback pour traiter les messages reçus
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();  // Reconnecter au broker si nécessaire
+  }
+  client.loop();
+
+  int sensorValue = digitalRead(IR);  // Lire l'état du capteur IR
+  
+  if (sensorValue == LOW) {
+    // Place occupée
+    digitalWrite(ledV, LOW);   // Éteindre la LED verte
+    digitalWrite(ledR, HIGH);  // Allumer la LED rouge
+    if (lastState != 0) {  // Éviter les publications répétées
+      client.publish("parking/status", "Place occupée");
+      Serial.println("Place occupée.");
+      lastState = 0;
+    }
+  } else {
+    // Place libre
+    digitalWrite(ledV, HIGH);  // Allumer la LED verte
+    digitalWrite(ledR, LOW);   // Éteindre la LED rouge
+    if (lastState != 1) {  // Éviter les publications répétées
+      client.publish("parking/status", "Place libre");
+      Serial.println("Place libre.");
+      lastState = 1;
+    }
+  }
+
+  delay(500);  // Petite pause pour réduire les appels fréquents
+}
